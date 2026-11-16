@@ -2104,7 +2104,31 @@ def generated_names(work):
     return names
 
 
-def forget_failed_build(work, linked, failed=()):
+def forget_renderer_objects(work):
+    """The renderer's objects (sa/build/obj/vk_*, nx2/build.py's vk_jobs) out of the work folder, its object cache and the store:
+    the next build compiles the renderer again, and nothing else"""
+    obj_dir = os.path.join(work, "sa", "build", "obj")
+    try:
+        names = [f for f in os.listdir(obj_dir) if f.startswith("vk_")]
+    except OSError:
+        return
+    keys = []
+    for f in names:
+        if f.endswith(".sha1"):
+            with contextlib.suppress(OSError), open(os.path.join(obj_dir, f)) as h:
+                keys.append(h.read().strip())
+    store = _object_store.folder(work)
+    if store:
+        _object_store.forget(store, keys)
+    for key in keys:
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(work, "objcache", key + ".o"))
+    for f in names:
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(obj_dir, f))
+
+
+def forget_failed_build(work, linked, failed=(), game_linked=False):
     """(hookshot) After a compile or link that failed. It forgets the lift: the next build translates the game again. A lifted file
     cut short (an antivirus, a full disk, a stopped run: "g_module_b" for g_module_base, issue 1197) or lifted C another builder
     left (20 undefined game functions at the link, issue 1176) otherwise failed the same way at every try, the key still matching.
@@ -2116,7 +2140,16 @@ def forget_failed_build(work, linked, failed=()):
     failed: the files build.py could not compile, alone too (its "FAILED <name>" lines). When every one is a source of the
     repository (host/, gpu/, third_party/), none the lift's or build.py's own, the translation is not what failed: it is kept, and
     the next build compiles the files not compiled yet without translating the game again (a typo in a host file cost a whole
-    lift, ~5 minutes on Windows). A build stopped without such a line, or one with a generated file among them, forgets it as before"""
+    lift, ~5 minutes on Windows). A build stopped without such a line, or one with a generated file among them, forgets it as before.
+    game_linked: the game itself linked (build.py's "linked <exe>: N MB"), and what failed came after it: the renderer's link or its
+    unresolved symbols (check_vk_symbols), made only of gpu/vk and its libraries. The translation and the game's objects linked, so
+    they are kept; only the renderer's objects go, in case a cached one is what failed (an extern written inside an
+    anonymous namespace in gpu/vk cost a whole lift and compile)"""
+    if game_linked:
+        forget_renderer_objects(work)
+        print("the build failed after the game linked, in the renderer: the next one keeps the translation and the game's "
+              "objects, and compiles only the renderer again", flush=True)
+        return
     if not linked and failed:
         generated = generated_names(work)
         if not any(name.startswith("code_") or name in generated for name in failed):
@@ -2522,8 +2555,17 @@ def note_installed(out, note, files):
         print("the note of the files copied in was not saved (%s): the next build copies them again" % e, flush=True)
 
 
+def game_copy(path, roots):
+    """Whether the process running path is a copy of the game being updated: hookshot.exe directly in one of roots (the
+    folder's launcher, bin\\hookshot.exe or its crash-watch helper), each root normcased and ending in a separator. Another
+    program the player keeps in the folder is not: the Hookshot Builder's exe kept there would be taken for the game, its window
+    named as Hookshot still running and the update stopped, and a windowless one would have been ended"""
+    path = os.path.normcase(path)
+    return os.path.basename(path) == "hookshot.exe" and os.path.dirname(path) + os.sep in roots
+
+
 def end_stale_games(folders):
-    """(Windows) The running processes whose exe is in one of folders (the game being updated): those with no visible window, a
+    """(Windows) The running copies of the game (game_copy) in one of folders, the game being updated: those with no visible window, a
     copy left behind (a shader preparation that hung, a game whose window closed but whose process did not end), are ended and
     waited for, as their file could not be replaced while they ran ("Could not replace bin/hookshot.exe", Discord 2026-11-10).
     Returns the process ids of those with a window, which the player is to close: a game in play is never ended."""
@@ -2558,8 +2600,7 @@ def end_stale_games(folders):
                 if h:
                     buf, n = ctypes.create_unicode_buffer(1024), wintypes.DWORD(1024)
                     if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)):
-                        path = os.path.normcase(buf.value)
-                        if any(path.startswith(r) for r in roots) and os.path.dirname(path) + os.sep in roots:
+                        if game_copy(buf.value, roots):
                             found.append(e.th32ProcessID)
                             parents[e.th32ProcessID] = e.th32ParentProcessID
                     k32.CloseHandle(h)
@@ -2901,10 +2942,13 @@ def main(a=None):
                 plan[:] = [int(parts[1]), int(parts[2])]
     linking = []   # (build.py's "compiled in Ns, 0 failed": every object made, the link next)
     failed = []   # (build.py's "FAILED <name> (...": a file that did not compile, alone either)
+    game_linked = []   # (build.py's "linked <...>/hookshot[.exe]: N MB": the game linked, the renderer's link next)
 
     def compile_line(line):
         if re.match(r"compiled in \d+s, 0 failed$", line):
             linking.append(line)
+        if re.match(r"linked .*[\\/]hookshot(\.exe)?: \d+ MB \(", line):
+            game_linked.append(line)
         m = re.match(r"FAILED (\S+) \(", line)
         if m:
             failed.append(m.group(1))
@@ -2922,7 +2966,7 @@ def main(a=None):
             done["n"] = 0.0
             run(PY + ["nx2/build.py", "--standalone", "--jobs", str(a.jobs)], env, compile_line)
     except SystemExit:
-        forget_failed_build(work, bool(linking), failed)
+        forget_failed_build(work, bool(linking), failed, bool(game_linked))
         raise
     compile_seconds = time.time() - compile_started
 
